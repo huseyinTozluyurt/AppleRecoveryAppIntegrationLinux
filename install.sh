@@ -232,7 +232,7 @@ install_deps() {
       local pkgs=(gcc gcc-c++ make git autoconf automake libtool pkg-config
                   libopenssl-devel libcurl-devel libzip-devel zlib-devel libusb-1_0-devel
                   readline-devel systemd-devel usbutils python3 ca-certificates curl shadow
-                  which findutils gawk tar gzip)
+                  which findutils diffutils gawk tar gzip)
       [[ $WITH_GUI -eq 1 ]] && pkgs+=(python3-tk)
       zypper --non-interactive --gpg-auto-import-keys refresh
       # --force-resolution lets zypper pick a matching -devel/library pair instead of stopping.
@@ -526,6 +526,8 @@ EOF
   [[ $REMOVE_DISTRO -eq 1 ]] && remove_distro_packages
   [[ $SKIP_DEPS -eq 0 ]] && install_deps
   setup_env
+  # libirecovery's configure needs the plugdev group to exist on non-systemd systems.
+  ensure_usbmux_user
   [[ $SKIP_BUILD -eq 0 ]] && build_all
   configure_system
   install_tools
