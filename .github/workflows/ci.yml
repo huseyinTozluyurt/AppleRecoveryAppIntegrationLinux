@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning install.sh
+        run: shellcheck -S warning install.sh share/init/usbmuxd.runit
       - name: Python syntax
         run: python3 -m py_compile bin/idr-doctor bin/idr-gui
       - name: idr-doctor explain smoke test
@@ -22,36 +22,45 @@ jobs:
             | python3 bin/idr-doctor explain | grep -q "status 94"
 
   install:
-    name: install (${{ matrix.image }})
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    continue-on-error: ${{ matrix.experimental || false }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        image:
-          - ubuntu:24.04
-          - ubuntu:22.04
-          - debian:12
-          - fedora:latest
-          - archlinux:latest
-          - opensuse/tumbleweed:latest
-    container: ${{ matrix.image }}
+        include:
+          # Debian family
+          - { name: Ubuntu 24.04,          image: "ubuntu:24.04",                    prep: "apt-get update && apt-get install -y bash" }
+          - { name: Ubuntu 22.04,          image: "ubuntu:22.04",                    prep: "apt-get update && apt-get install -y bash" }
+          - { name: Debian 12,             image: "debian:12",                       prep: "apt-get update" }
+          - { name: Debian 13,             image: "debian:13",                       prep: "apt-get update" }
+          - { name: Linux Mint 22,         image: "linuxmintd/mint22-amd64",         prep: "apt-get update" }
+          - { name: Kali rolling,          image: "kalilinux/kali-rolling",          prep: "apt-get update" }
+          - { name: Debian 12 arm64 (Raspberry Pi OS base), image: "debian:12", runner: ubuntu-24.04-arm, prep: "apt-get update" }
+          # Red Hat family
+          - { name: Fedora,                image: "fedora:latest",                   prep: "true" }
+          - { name: Rocky Linux 9,         image: "rockylinux/rockylinux:9",         prep: "true" }
+          - { name: AlmaLinux 8,           image: "almalinux:8",                     prep: "true" }
+          # Arch family
+          - { name: Arch Linux,            image: "archlinux:latest",                prep: "true" }
+          # SUSE family
+          - { name: openSUSE Tumbleweed,   image: "opensuse/tumbleweed:latest",      prep: "true" }
+          - { name: openSUSE Leap 15.6,    image: "opensuse/leap:15.6",              prep: "true" }
+          # Independent
+          - { name: Alpine,                image: "alpine:latest",                   prep: "apk add --no-cache bash" }
+          - { name: Void Linux,            image: "ghcr.io/void-linux/void-glibc-full:latest", prep: "xbps-install -Syu xbps && xbps-install -y bash" }
+          - { name: Gentoo,                image: "gentoo/stage3:latest",            prep: "emerge-webrsync -q", experimental: true }
     steps:
-      - name: Prerequisites for checkout
-        run: |
-          if command -v apt-get >/dev/null; then apt-get update && apt-get install -y git
-          elif command -v dnf >/dev/null; then dnf install -y git
-          elif command -v pacman >/dev/null; then pacman -Sy --noconfirm git
-          elif command -v zypper >/dev/null; then zypper --non-interactive install git tar gzip
-          fi
       - uses: actions/checkout@v4
-      - name: Run installer
-        run: bash ./install.sh -y --remove-distro-packages
-      - name: Verify
+      - name: Install in ${{ matrix.image }}
         run: |
-          /usr/local/bin/idevicerestore --version
-          /usr/local/bin/irecovery --version || true
-          ldd /usr/local/bin/idevicerestore | grep libtatsu
-          python3 /usr/local/bin/idr-doctor device || true
-      - name: Show build log on failure
-        if: failure()
-        run: tail -n 100 /var/log/idevicerestore-setup.log || true
+          docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" sh -c '
+            set -e
+            ${{ matrix.prep }}
+            cp -r /src /tmp/idr && cd /tmp/idr
+            bash ./install.sh -y --remove-distro-packages || { tail -n 80 /var/log/idevicerestore-setup.log; exit 1; }
+            /usr/local/bin/idevicerestore --version
+            ldd /usr/local/bin/idevicerestore | grep libtatsu
+            python3 /usr/local/bin/idr-doctor device || true
+          '

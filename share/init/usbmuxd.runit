@@ -1,0 +1,3 @@
+#!/bin/sh
+# usbmuxd for runit (Void, Artix runit)
+exec @SBINDIR@/usbmuxd -f -U usbmux 2>&1

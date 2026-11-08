@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+# usbmuxd for OpenRC (Alpine, Gentoo, Artix, Devuan with OpenRC)
+description="Apple mobile device USB multiplexing daemon"
+command="@SBINDIR@/usbmuxd"
+command_args="-f -U usbmux"
+command_background=yes
+pidfile="/run/usbmuxd-openrc.pid"
+
+depend() {
+	need localmount
+	after udev
+}

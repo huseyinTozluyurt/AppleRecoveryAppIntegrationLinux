@@ -37,7 +37,7 @@ Prefer a window? Install with `sudo ./install.sh --with-gui` and run `idr-gui`
 
 | Step | Details |
 |---|---|
-| Detect distro | Debian, Ubuntu, Mint, Pop!_OS (apt), Fedora/RHEL/Rocky/Alma (dnf), Arch/Manjaro (pacman), openSUSE (zypper) |
+| Detect distro | Package manager, init system and CPU architecture (see the table below) |
 | Remove conflicts | Offers to purge `libimobiledevice6 libimobiledevice-utils idevicerestore usbmuxd libusbmuxd6 libusbmuxd-dev libirecovery3` (the old versions that cause TSS status 94). Use `--remove-distro-packages` to skip the question |
 | Build deps | compiler, autotools, pkg-config, OpenSSL, libcurl, libzip, zlib, libusb, readline, udev/systemd headers |
 | Build from source | `libplist → libimobiledevice-glue → libtatsu → libusbmuxd → libimobiledevice → libirecovery → usbmuxd → idevicerestore` into `/usr/local`, with `PKG_CONFIG_PATH` and `ldconfig` handled for you (including lib64 distros) |
@@ -51,6 +51,29 @@ Re-running the installer updates everything to the latest upstream source.
 
 On desktops, removing `libimobiledevice6` can also remove `gvfs-backends`
 (iPhone access in the file manager). Reinstall it later if you need it.
+
+## Supported distributions
+
+| Family | Tested in CI | Also detected (via `ID_LIKE`) |
+|---|---|---|
+| Debian / Ubuntu (apt) | Ubuntu 22.04 and 24.04, Debian 12 and 13, Linux Mint 22, Kali, Debian 12 on ARM64 | Pop!_OS, elementary, Zorin, Raspberry Pi OS, MX, Deepin, Devuan |
+| Red Hat (dnf/yum) | Fedora, Rocky Linux 9, AlmaLinux 8 | RHEL, CentOS Stream, Oracle Linux, Nobara. CRB/PowerTools and EPEL are enabled for you |
+| Arch (pacman) | Arch Linux | Manjaro, EndeavourOS, Garuda, CachyOS, Artix (eudev) |
+| SUSE (zypper) | openSUSE Tumbleweed, Leap 15.6 | SLES |
+| Alpine (apk) | Alpine | postmarketOS. Needs `apk add bash` first |
+| Void (xbps) | Void glibc | Void musl |
+| Gentoo (emerge) | Gentoo (best effort) | Funtoo |
+
+**Init systems.** The installer works with systemd, OpenRC (where it installs `/etc/init.d/usbmuxd`), runit (`/etc/sv/usbmuxd`), and sysvinit. Without systemd, udev starts usbmuxd when a device is plugged in.
+
+**CPU.** Everything is built from source, so ARM64 boards such as the Raspberry Pi 4/5 work as well as x86_64.
+
+**Not supported by the installer.** On these systems it stops and explains what to do instead:
+- NixOS: use `services.usbmuxd.enable` and the nixpkgs packages.
+- Fedora Silverblue and other image-based systems: use `rpm-ostree install` or a distrobox.
+- SteamOS: `/usr` is read-only.
+
+Any other distro can still use the installer: install the build dependencies yourself, then run `sudo ./install.sh --skip-deps`.
 
 ## What `idr-doctor` checks
 
