@@ -357,10 +357,17 @@ def check_dns_tcp(r):
     return reachable
 
 
-def http(url, data=None, timeout=15, headers=None):
+def http(url, data=None, timeout=15, headers=None, verify=True):
     req = urllib.request.Request(url, data=data, headers=headers or {})
     req.add_header("User-Agent", "InetURL/1.0")
-    ctx = ssl.create_default_context()
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        # gs.apple.com presents a certificate from Apple's own CA, which is not in the
+        # system trust store. libtatsu (idevicerestore) also skips verification here.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
 
@@ -369,8 +376,8 @@ def check_tss(r):
     STATUS=...&MESSAGE=... line (a rejection, which is expected for an empty request)."""
     body = plistlib.dumps({})
     try:
-        with http(TSS_URL, data=body, headers={"Content-Type": 'text/xml; charset="utf-8"',
-                                               "Cache-Control": "no-cache"}) as resp:
+        with http(TSS_URL, data=body, verify=False,
+                  headers={"Content-Type": 'text/xml; charset="utf-8"', "Cache-Control": "no-cache"}) as resp:
             text = resp.read(400).decode("utf-8", "replace")
             date = resp.headers.get("Date")
         if "STATUS=" in text or "<?xml" in text:
