@@ -20,6 +20,14 @@ fresh machine.
 
 ## Quick start
 
+One line (downloads this repo and runs the installer):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/huseyinTozluyurt/idevicerestore-setup/main/get.sh | bash
+```
+
+Or step by step:
+
 ```bash
 git clone https://github.com/huseyinTozluyurt/idevicerestore-setup.git
 cd idevicerestore-setup
@@ -63,6 +71,7 @@ On desktops, removing `libimobiledevice6` can also remove `gvfs-backends`
 | Alpine (apk) | Alpine | postmarketOS. Needs `apk add bash` first |
 | Void (xbps) | Void glibc | Void musl |
 | Gentoo (emerge) | Gentoo (best effort) | Funtoo |
+| Solus (eopkg) | not in CI (best effort) | |
 
 **Init systems.** The installer works with systemd, OpenRC (where it installs `/etc/init.d/usbmuxd`), runit (`/etc/sv/usbmuxd`), and sysvinit. Without systemd, udev starts usbmuxd when a device is plugged in.
 
@@ -116,7 +125,7 @@ After a restore, a device that had Find My enabled asks for the owner's Apple ID
 ## Updating
 
 ```bash
-cd idevicerestore-setup && git pull && sudo ./install.sh -y
+cd idevicerestore-setup && git pull && sudo ./install.sh --update
 ```
 
 This also rebuilds the libimobiledevice stack from the latest upstream source,

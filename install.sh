@@ -18,6 +18,7 @@
 #   apk     Alpine, postmarketOS
 #   xbps    Void Linux (glibc and musl)
 #   emerge  Gentoo, Funtoo
+#   eopkg   Solus
 # Init systems: systemd, OpenRC, runit, or none (usbmuxd is then started by udev).
 # CPU: any architecture the distro supports (x86_64, aarch64/Raspberry Pi, armv7, ...).
 #
@@ -75,6 +76,7 @@ Options:
                           libimobiledevice-utils, libirecovery-utils) that can
                           shadow or conflict with the fresh build
   --with-gui              Also install the Tk dependency for idr-gui
+  --update                Pull the latest upstream sources and rebuild (same as a re-run)
   --uninstall             Remove what this script installed
   -h, --help              Show this help
 EOF
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --remove-distro-packages) REMOVE_DISTRO=1 ;;
     --with-gui) WITH_GUI=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --update) ASSUME_YES=1; SKIP_DEPS=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (see --help)" ;;
   esac
@@ -126,11 +129,12 @@ detect_distro() {
   elif [[ "$ids" =~ \ (alpine|postmarketos)\  ]] && command -v apk >/dev/null; then PM=apk
   elif [[ "$ids" =~ \ void\  ]] && command -v xbps-install >/dev/null; then PM=xbps
   elif [[ "$ids" =~ \ (gentoo|funtoo)\  ]] && command -v emerge >/dev/null; then PM=emerge
+  elif [[ "$ids" =~ \ solus\  ]] && command -v eopkg >/dev/null; then PM=eopkg
   else PM=""
   fi
   # Fall back to whatever package manager exists.
   if [[ -z "$PM" ]]; then
-    for c in apt-get:apt dnf:dnf yum:yum pacman:pacman zypper:zypper apk:apk xbps-install:xbps emerge:emerge; do
+    for c in apt-get:apt dnf:dnf yum:yum pacman:pacman zypper:zypper apk:apk xbps-install:xbps emerge:emerge eopkg:eopkg; do
       if command -v "${c%%:*}" >/dev/null; then PM="${c##*:}"; break; fi
     done
   fi
@@ -252,6 +256,13 @@ install_deps() {
                   dev-libs/libusb sys-libs/readline virtual/udev sys-apps/usbutils dev-lang/python)
       emerge --noreplace --quiet-build=y "${pkgs[@]}" \
         || die "emerge failed. On older Gentoo profiles autotools live in sys-devel/*; install them and re-run with --skip-deps."
+      ;;
+    eopkg)
+      eopkg install -y -c system.devel
+      local pkgs=(git autoconf automake libtool pkgconf openssl-devel curl-devel libzip-devel
+                  zlib-devel libusb-devel readline-devel systemd-devel usbutils python3)
+      [[ $WITH_GUI -eq 1 ]] && pkgs+=(python3-tkinter)
+      eopkg install -y "${pkgs[@]}"
       ;;
     none) ;;
   esac

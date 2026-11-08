@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning install.sh share/init/usbmuxd.runit
+        run: shellcheck -S warning install.sh get.sh share/init/usbmuxd.runit
       - name: Python syntax
         run: python3 -m py_compile bin/idr-doctor bin/idr-gui
       - name: idr-doctor explain smoke test
@@ -63,4 +63,6 @@ jobs:
             /usr/local/bin/idevicerestore --version
             ldd /usr/local/bin/idevicerestore | grep libtatsu
             python3 /usr/local/bin/idr-doctor device || true
+            bash ./install.sh --uninstall
+            test ! -e /usr/local/bin/idevicerestore
           '
