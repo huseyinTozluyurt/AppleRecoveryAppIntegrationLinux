@@ -1,5 +1,7 @@
 # idevicerestore-setup
 
+[![CI](https://github.com/huseyinTozluyurt/idevicerestore-setup/actions/workflows/ci.yml/badge.svg)](https://github.com/huseyinTozluyurt/idevicerestore-setup/actions/workflows/ci.yml)
+
 A setup and diagnostic tool that prepares any Linux machine to restore iPhones,
 iPads and iPods with [idevicerestore](https://github.com/libimobiledevice/idevicerestore),
 and explains what went wrong when a restore fails, especially:
@@ -19,7 +21,7 @@ fresh machine.
 ## Quick start
 
 ```bash
-git clone <this repo> idevicerestore-setup
+git clone https://github.com/huseyinTozluyurt/idevicerestore-setup.git
 cd idevicerestore-setup
 sudo ./install.sh            # asks before removing old distro packages
 idr-doctor                   # check everything with the device plugged in
@@ -88,8 +90,29 @@ error means no ticket came back. In practice the causes are:
 After a restore, a device that had Find My enabled asks for the owner's Apple ID
 (Activation Lock). That is expected and is not something this tool touches.
 
+## Updating
+
+```bash
+cd idevicerestore-setup && git pull && sudo ./install.sh -y
+```
+
+This also rebuilds the libimobiledevice stack from the latest upstream source,
+which is what new iPhone models and iOS releases usually need.
+
+## Contributing
+
+Issues and pull requests are welcome. If a restore fails, please attach the
+output of `idr-doctor` and the log from `~/idevicerestore-logs/`
+(remove your ECID and serial number first). The CI builds the full stack on
+Ubuntu 22.04/24.04, Debian 12, Fedora, Arch and openSUSE every week.
+
 ## Uninstall
 
 ```bash
 sudo ./install.sh --uninstall
 ```
+
+## License
+
+MIT for the scripts in this repository. The libimobiledevice projects it builds
+are licensed separately (LGPL-2.1 / GPL-3.0); see their repositories.

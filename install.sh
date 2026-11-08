@@ -132,7 +132,7 @@ install_deps() {
     dnf)
       local pkgs=(gcc gcc-c++ make git autoconf automake libtool pkgconf-pkg-config
                   openssl-devel libcurl-devel libzip-devel zlib-devel libusb1-devel
-                  readline-devel systemd-devel usbutils python3 ca-certificates curl)
+                  readline-devel systemd-devel usbutils python3 ca-certificates curl shadow-utils)
       [[ $WITH_GUI -eq 1 ]] && pkgs+=(python3-tkinter)
       dnf install -y "${pkgs[@]}"
       ;;
@@ -145,7 +145,7 @@ install_deps() {
     zypper)
       local pkgs=(gcc gcc-c++ make git autoconf automake libtool pkg-config
                   libopenssl-devel libcurl-devel libzip-devel zlib-devel libusb-1_0-devel
-                  readline-devel systemd-devel usbutils python3 ca-certificates curl)
+                  readline-devel systemd-devel usbutils python3 ca-certificates curl shadow)
       [[ $WITH_GUI -eq 1 ]] && pkgs+=(python3-tk)
       zypper --non-interactive install --no-recommends "${pkgs[@]}"
       ;;
@@ -226,7 +226,7 @@ setup_env() {
   export PATH="$PREFIX/bin:$PREFIX/sbin:$PATH"
   # Make sure the dynamic loader finds libraries in the prefix (not default on Fedora/openSUSE).
   if [[ "$PREFIX" != "/usr" ]]; then
-    printf '%s\n' $(libdirs) > /etc/ld.so.conf.d/idevicerestore-setup.conf
+    printf '%s\n' "$PREFIX/lib" "$PREFIX/lib64" > /etc/ld.so.conf.d/idevicerestore-setup.conf
     ldconfig
   fi
 }
