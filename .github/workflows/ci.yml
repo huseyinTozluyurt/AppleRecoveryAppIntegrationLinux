@@ -11,7 +11,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck
         run: shellcheck -S warning install.sh get.sh share/init/usbmuxd.runit
       - name: Python syntax
@@ -52,7 +52,7 @@ jobs:
           - { name: Void Linux,            image: "ghcr.io/void-linux/void-glibc-full:latest", prep: "xbps-install -Syu xbps && xbps-install -y bash" }
           - { name: Gentoo,                image: "gentoo/stage3:latest",            prep: "emerge-webrsync -q", experimental: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install in ${{ matrix.image }}
         run: |
           docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" sh -c '

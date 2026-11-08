@@ -220,10 +220,10 @@ install_deps() {
       local pkgs=(base-devel git autoconf automake libtool pkgconf openssl curl libzip
                   zlib libusb readline usbutils python ca-certificates)
       # Artix and other systemd-free Arch derivatives ship udev separately.
-      if pacman -Si systemd >/dev/null 2>&1 && [[ "$INIT" != "openrc" && "$INIT" != "runit" ]]; then
-        pkgs+=(systemd)
-      else
+      if [[ "$INIT" == "openrc" || "$INIT" == "runit" ]]; then
         pkgs+=(eudev)
+      else
+        pkgs+=(systemd)
       fi
       [[ $WITH_GUI -eq 1 ]] && pkgs+=(tk)
       pacman -Syu --needed --noconfirm "${pkgs[@]}"
@@ -231,9 +231,12 @@ install_deps() {
     zypper)
       local pkgs=(gcc gcc-c++ make git autoconf automake libtool pkg-config
                   libopenssl-devel libcurl-devel libzip-devel zlib-devel libusb-1_0-devel
-                  readline-devel systemd-devel usbutils python3 ca-certificates curl shadow)
+                  readline-devel systemd-devel usbutils python3 ca-certificates curl shadow
+                  which findutils gawk tar gzip)
       [[ $WITH_GUI -eq 1 ]] && pkgs+=(python3-tk)
-      zypper --non-interactive install --no-recommends "${pkgs[@]}"
+      zypper --non-interactive --gpg-auto-import-keys refresh
+      # --force-resolution lets zypper pick a matching -devel/library pair instead of stopping.
+      zypper --non-interactive install --no-recommends --force-resolution "${pkgs[@]}"
       ;;
     apk)
       local pkgs=(build-base git autoconf automake libtool pkgconf linux-headers
