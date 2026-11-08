@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""idr-gui: a small graphical front end for idr-doctor and idevicerestore.
+
+Every action runs the same command you could type in a terminal; the command is
+shown in the output pane. Actions that need root use pkexec (a password prompt).
+"""
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext
+except ImportError:
+    sys.exit("Tk is not installed. Install python3-tk (Debian/Ubuntu/openSUSE), python3-tkinter (Fedora) "
+             "or tk (Arch), or use the command line: idr-doctor")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SHARE = "/usr/local/share/idevicerestore-setup"
+
+
+def find(name):
+    for cand in (os.path.join(HERE, name), os.path.join(SHARE, name), shutil.which(name)):
+        if cand and os.path.exists(cand):
+            return cand
+    return name
+
+
+DOCTOR = find("idr-doctor")
+INSTALLER = next((p for p in (os.path.join(HERE, "..", "install.sh"), os.path.join(SHARE, "install.sh"),
+                               os.path.join(HERE, "..", "share", "idevicerestore-setup", "install.sh"))
+                  if os.path.exists(p)), None)
+LOG_DIR = os.path.expanduser("~/idevicerestore-logs")
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.proc = None
+        self.q = queue.Queue()
+        root.title("idevicerestore setup & doctor")
+        root.geometry("900x620")
+
+        bar = tk.Frame(root, padx=8, pady=8)
+        bar.pack(fill="x")
+        buttons = [
+            ("Diagnose", self.diagnose),
+            ("Install / repair toolchain", self.install),
+            ("Check IPSW…", self.check_ipsw),
+            ("Restore latest signed (erase)", self.restore_latest),
+            ("Restore from IPSW (erase)…", self.restore_ipsw),
+            ("Explain log…", self.explain),
+            ("Stop", self.stop),
+        ]
+        for i, (label, fn) in enumerate(buttons):
+            tk.Button(bar, text=label, command=fn).grid(row=i // 4, column=i % 4, sticky="ew", padx=3, pady=3)
+        for col in range(4):
+            bar.columnconfigure(col, weight=1)
+
+        self.status = tk.StringVar(value="Ready. Connect the device, then click Diagnose.")
+        tk.Label(root, textvariable=self.status, anchor="w", padx=10).pack(fill="x")
+        self.out = scrolledtext.ScrolledText(root, font=("monospace", 10), wrap="word")
+        self.out.pack(fill="both", expand=True, padx=8, pady=8)
+        self.out.insert("end", "This tool restores devices you own using Apple-signed firmware. It cannot "
+                               "bypass firmware signing or Activation Lock.\n\n")
+        root.after(100, self.pump)
+
+    # ------------------------------------------------------------ running --
+    def run(self, cmd, title, root_needed=False):
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("Busy", "Another task is still running.")
+            return
+        if root_needed and os.geteuid() != 0:
+            if not shutil.which("pkexec"):
+                messagebox.showerror("pkexec missing", "Run this action from a terminal with sudo:\n\n"
+                                     + "sudo " + " ".join(cmd))
+                return
+            cmd = ["pkexec", "env", f"PATH=/usr/local/sbin:/usr/local/bin:{os.environ.get('PATH', '')}"] + cmd
+        self.out.insert("end", f"\n$ {' '.join(cmd)}\n")
+        self.out.see("end")
+        self.status.set(title + "…")
+        env = dict(os.environ, NO_COLOR="1")
+
+        def worker():
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                             bufsize=1, env=env)
+                for line in self.proc.stdout:
+                    self.q.put(line)
+                rc = self.proc.wait()
+                self.q.put(("done", title, rc))
+            except FileNotFoundError as e:
+                self.q.put(f"Could not start: {e}\n")
+                self.q.put(("done", title, 127))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def pump(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if isinstance(item, tuple):
+                    _, title, rc = item
+                    self.status.set(f"{title}: {'finished' if rc == 0 else f'finished with problems (exit {rc})'}")
+                else:
+                    self.out.insert("end", item)
+                    self.out.see("end")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.pump)
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            if messagebox.askyesno("Stop", "Stop the running task? Interrupting a restore can leave the device "
+                                           "in Recovery mode (you can simply restore again)."):
+                self.proc.terminate()
+
+    # ------------------------------------------------------------ actions --
+    def diagnose(self):
+        self.run([sys.executable, DOCTOR, "check"], "Diagnosis")
+
+    def install(self):
+        if not INSTALLER:
+            messagebox.showerror("Installer not found", "install.sh was not found next to this program.")
+            return
+        if messagebox.askyesno("Install / repair",
+                               "This installs build tools, removes outdated distro packages and builds "
+                               "libimobiledevice, libtatsu, usbmuxd, libirecovery and idevicerestore from source. "
+                               "It takes a few minutes. Continue?"):
+            self.run(["bash", os.path.realpath(INSTALLER), "-y", "--remove-distro-packages"],
+                     "Install", root_needed=True)
+
+    def check_ipsw(self):
+        f = filedialog.askopenfilename(title="Choose an IPSW", filetypes=[("IPSW firmware", "*.ipsw"), ("All", "*")])
+        if f:
+            self.run([sys.executable, DOCTOR, "ipsw", f], "IPSW check")
+
+    def _restore(self, extra, what):
+        if not messagebox.askyesno("Erase and restore",
+                                   f"This ERASES all data on the connected device and installs {what}.\n\n"
+                                   "If Find My is on, the owner's Apple ID is needed after the restore.\n\nContinue?",
+                                   icon="warning"):
+            return
+        self.run([sys.executable, DOCTOR, "restore", "--log-dir", LOG_DIR, "--", "-e"] + extra,
+                 "Restore", root_needed=True)
+
+    def restore_latest(self):
+        self._restore(["-l"], "the latest iOS that Apple signs")
+
+    def restore_ipsw(self):
+        f = filedialog.askopenfilename(title="Choose an IPSW", filetypes=[("IPSW firmware", "*.ipsw"), ("All", "*")])
+        if f:
+            self._restore([f], os.path.basename(f))
+
+    def explain(self):
+        f = filedialog.askopenfilename(title="Choose an idevicerestore log", initialdir=LOG_DIR
+                                       if os.path.isdir(LOG_DIR) else os.path.expanduser("~"))
+        if f:
+            self.run([sys.executable, DOCTOR, "explain", f], "Log analysis")
+
+
+if __name__ == "__main__":
+    tk_root = tk.Tk()
+    App(tk_root)
+    tk_root.mainloop()

@@ -1,0 +1,95 @@
+# idevicerestore-setup
+
+A setup and diagnostic tool that prepares any Linux machine to restore iPhones,
+iPads and iPods with [idevicerestore](https://github.com/libimobiledevice/idevicerestore),
+and explains what went wrong when a restore fails, especially:
+
+```
+ERROR: Unable to get SHSH blobs for this device
+```
+
+It turns the manual Ubuntu procedure (purge old APT packages, install build tools,
+build the libimobiledevice stack from source in the right order, restart usbmuxd,
+restore) into one command, and adds checks for the problems that usually stop a
+fresh machine.
+
+> This tool restores devices you own using firmware Apple is currently signing.
+> It does not and cannot bypass firmware signing or Activation Lock.
+
+## Quick start
+
+```bash
+git clone <this repo> idevicerestore-setup
+cd idevicerestore-setup
+sudo ./install.sh            # asks before removing old distro packages
+idr-doctor                   # check everything with the device plugged in
+sudo idr-doctor restore -- -e -l                       # erase + latest signed iOS
+sudo idr-doctor restore -- -e ./iPhone12,1_27.2_24B119_Restore.ipsw   # or a downloaded IPSW
+idr-doctor clean --ipsw      # delete the IPSW and extracted folders afterwards
+```
+
+Prefer a window? Install with `sudo ./install.sh --with-gui` and run `idr-gui`
+(or "iDevice Restore Doctor" from the app menu).
+
+## What `install.sh` does
+
+| Step | Details |
+|---|---|
+| Detect distro | Debian, Ubuntu, Mint, Pop!_OS (apt), Fedora/RHEL/Rocky/Alma (dnf), Arch/Manjaro (pacman), openSUSE (zypper) |
+| Remove conflicts | Offers to purge `libimobiledevice6 libimobiledevice-utils idevicerestore usbmuxd libusbmuxd6 libusbmuxd-dev libirecovery3` (the old versions that cause TSS status 94). Use `--remove-distro-packages` to skip the question |
+| Build deps | compiler, autotools, pkg-config, OpenSSL, libcurl, libzip, zlib, libusb, readline, udev/systemd headers |
+| Build from source | `libplist → libimobiledevice-glue → libtatsu → libusbmuxd → libimobiledevice → libirecovery → usbmuxd → idevicerestore` into `/usr/local`, with `PKG_CONFIG_PATH` and `ldconfig` handled for you (including lib64 distros) |
+| udev + usbmuxd | Installs rules for normal, Recovery and DFU mode to `/etc/udev/rules.d`, creates the `usbmux` user, installs and enables the systemd service |
+| Tools | Installs `idr-doctor` and `idr-gui` |
+
+Options: `--yes`, `--prefix DIR`, `--src-dir DIR`, `--jobs N`, `--skip-deps`,
+`--skip-build`, `--remove-distro-packages`, `--with-gui`, `--uninstall`.
+The full build log is written to `/var/log/idevicerestore-setup.log`.
+Re-running the installer updates everything to the latest upstream source.
+
+On desktops, removing `libimobiledevice6` can also remove `gvfs-backends`
+(iPhone access in the file manager). Reinstall it later if you need it.
+
+## What `idr-doctor` checks
+
+| Area | Checks |
+|---|---|
+| Toolchain | idevicerestore present, which copy runs, duplicates on PATH, linked against libtatsu, unresolved libraries, all library versions |
+| usbmuxd / udev | daemon running, socket present, udev rules installed |
+| Device | Apple device on USB, its mode (Normal / Recovery / DFU), USB speed, model, iOS version, ECID, pairing problems |
+| Network | proxy settings and the `sudo` proxy trap, `/etc/hosts` redirects of `gs.apple.com`, DNS for all three TSS hostnames, TCP reachability, a live request to Apple's TSS server, clock skew, access to Apple's firmware list |
+| Signing | which iOS versions Apple signs right now for the device (via api.ipsw.me), and whether your IPSW is one of them and is meant for your model |
+
+Other commands: `idr-doctor network`, `device`, `signed iPhone12,1`,
+`ipsw FILE`, `explain LOG`, `restore -- ARGS`, `clean`.
+`idr-doctor restore` saves every run to `~/idevicerestore-logs/` and explains a failure automatically.
+
+## Why "Unable to get SHSH blobs for this device" happens
+
+Before writing firmware, idevicerestore sends the device's ECID and the firmware's
+hashes to Apple's TSS server (`gs.apple.com`). Apple returns a signed ticket (the
+"SHSH blob") only for firmware it is still signing, for that exact device. The
+error means no ticket came back. In practice the causes are:
+
+1. **The firmware is no longer signed.** Apple stops signing older iOS versions
+   soon after a new release. TSS answers status 94 ("This device isn't eligible
+   for the requested build"). Fix: `sudo idevicerestore -e -l` to use the latest
+   signed version. Downgrading to an unsigned version is not possible.
+2. **Outdated distro build.** APT's idevicerestore and libimobiledevice are years
+   old and predate libtatsu, so they build requests Apple rejects for newer
+   devices (also status 94, or 100/126). Fix: `sudo ./install.sh --remove-distro-packages`.
+3. **No network path to Apple.** Firewalls, VPNs, DNS ad-blockers, captive portals,
+   or a proxy that `sudo` drops. Fix: allow `gs.apple.com`, or use `sudo -E`.
+4. **`/etc/hosts` redirect.** Old jailbreak/SHSH tools pointed `gs.apple.com` at
+   third-party servers. Fix: remove the line.
+5. **Wrong IPSW for the model.** Fix: download the IPSW for the exact model
+   identifier `idr-doctor` shows (e.g. `iPhone12,1`).
+
+After a restore, a device that had Find My enabled asks for the owner's Apple ID
+(Activation Lock). That is expected and is not something this tool touches.
+
+## Uninstall
+
+```bash
+sudo ./install.sh --uninstall
+```

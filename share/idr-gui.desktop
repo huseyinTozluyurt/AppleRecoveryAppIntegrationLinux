@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=iDevice Restore Doctor
+Comment=Set up idevicerestore and diagnose restore problems
+Exec=idr-gui
+Icon=phone
+Terminal=false
+Categories=Utility;System;

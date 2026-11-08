@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""idr-doctor: check a Linux machine for everything idevicerestore needs, and
+explain failures such as "ERROR: Unable to get SHSH blobs for this device".
+
+Usage:
+  idr-doctor [check]              full diagnosis (tools, usbmuxd, USB device, network, signing)
+  idr-doctor network              only Apple TSS / download connectivity checks
+  idr-doctor device               only USB / device mode checks
+  idr-doctor signed [MODEL]       list firmware Apple is still signing (e.g. iPhone12,1)
+  idr-doctor ipsw FILE            check an .ipsw against the attached device and signing status
+  idr-doctor explain [LOGFILE]    explain an idevicerestore log (reads stdin if no file)
+  idr-doctor restore -- ARGS      run idevicerestore ARGS, save a log, explain any failure
+  idr-doctor clean [DIR]          delete extracted IPSW folders left after a restore
+
+This tool only helps legitimate restores of devices you own. It does not and
+cannot bypass Apple's firmware signing or Activation Lock.
+"""
+import argparse
+import datetime as dt
+import email.utils
+import glob
+import json
+import os
+import plistlib
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import zipfile
+
+VERSION = "1.0.0"
+APPLE_VID = "05ac"
+TSS_HOSTS = ["gs.apple.com", "gs.apple.com.akadns.net", "gs.apple.com.v.aaplimg.com"]
+TSS_URL = "https://gs.apple.com/TSS/controller?action=2"
+VERSION_XML_URL = "http://itunes.apple.com/check/version"
+IPSW_API = "https://api.ipsw.me/v4/device/{}?type=ipsw"
+# Known bogus TSS redirects (old jailbreak / SHSH caching tools wrote these to /etc/hosts).
+BAD_TSS_IPS = {"74.208.105.171", "74.208.10.249", "127.0.0.1", "0.0.0.0"}
+
+# USB product IDs -> mode (vendor 05ac)
+USB_MODES = {
+    "1222": "WTF (legacy DFU)",
+    "1227": "DFU",
+    "1280": "Recovery",
+    "1281": "Recovery",
+    "1282": "Recovery",
+    "1283": "Recovery",
+    "1338": "DFU (checkm8)",
+    "8600": "iBridge (T1)",
+}
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+
+class Report:
+    def __init__(self):
+        self.problems = []  # (title, explanation, fix)
+        self.warnings = []
+
+    def ok(self, msg):
+        print(f"  {c('32', 'OK  ')} {msg}")
+
+    def info(self, msg):
+        print(f"  {c('36', 'INFO')} {msg}")
+
+    def warn(self, msg, fix=None):
+        print(f"  {c('33', 'WARN')} {msg}")
+        self.warnings.append((msg, fix))
+
+    def fail(self, title, why, fix):
+        print(f"  {c('31', 'FAIL')} {title}")
+        self.problems.append((title, why, fix))
+
+    def section(self, name):
+        print("\n" + c("1", name))
+
+    def summary(self):
+        print("\n" + c("1", "Summary"))
+        if not self.problems and not self.warnings:
+            print("  " + c("32", "No problems found in the checks above."))
+            return 0
+        for i, (title, why, fix) in enumerate(self.problems, 1):
+            print(f"\n  {c('31', f'{i}. {title}')}")
+            print(f"     Why:  {why}")
+            print(f"     Fix:  {fix}")
+        for msg, fix in self.warnings:
+            if fix:
+                print(f"\n  {c('33', 'Note:')} {msg}\n     Fix:  {fix}")
+        return 1 if self.problems else 0
+
+
+def run(cmd, timeout=15):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+
+def all_on_path(name):
+    seen, out = set(), []
+    for d in os.environ.get("PATH", "").split(os.pathsep) + ["/usr/local/sbin", "/usr/sbin", "/sbin"]:
+        p = os.path.realpath(os.path.join(d, name))
+        if os.access(p, os.X_OK) and p not in seen and os.path.isfile(p):
+            seen.add(p)
+            out.append(os.path.join(d, name))
+    return out
+
+
+# --------------------------------------------------------------- tools ----
+def check_tools(r):
+    r.section("Toolchain")
+    paths = all_on_path("idevicerestore")
+    if not paths:
+        r.fail("idevicerestore is not installed",
+               "Nothing can restore the device without it.",
+               "Run: sudo ./install.sh")
+        return
+    main = shutil.which("idevicerestore") or paths[0]
+    _, ver = run([main, "--version"])
+    ver = ver.splitlines()[0] if ver else "unknown"
+    r.ok(f"idevicerestore: {main} ({ver})")
+    if len(paths) > 1:
+        r.warn(f"Several idevicerestore binaries found: {', '.join(paths)}",
+               "Remove the old distro copy (sudo ./install.sh --skip-build --remove-distro-packages) "
+               "or always call /usr/local/bin/idevicerestore explicitly.")
+    _, ldd = run(["ldd", main])
+    missing = [l.split()[0] for l in ldd.splitlines() if "not found" in l]
+    tatsu = [l for l in ldd.splitlines() if "libtatsu" in l]
+    if missing:
+        r.fail("idevicerestore cannot load its libraries: " + ", ".join(missing),
+               "The libraries were built into /usr/local/lib but the dynamic loader is not looking there.",
+               "Run: echo /usr/local/lib | sudo tee /etc/ld.so.conf.d/local.conf && sudo ldconfig")
+    elif tatsu:
+        r.ok("linked against libtatsu: " + tatsu[0].split("=>")[-1].split("(")[0].strip())
+    elif ldd:
+        r.fail("idevicerestore is an outdated build (no libtatsu)",
+               "Distro packages (e.g. Ubuntu's idevicerestore 1.0.0 from 2020) predate libtatsu and do not "
+               "know newer devices or firmware. Apple's TSS server then rejects the request (often status 94) "
+               "and you see 'Unable to get SHSH blobs for this device'.",
+               "Run: sudo ./install.sh --remove-distro-packages  (builds the current upstream source)")
+
+    for tool in ["irecovery", "ideviceinfo", "idevice_id", "usbmuxd"]:
+        p = shutil.which(tool) or (all_on_path(tool) or [None])[0]
+        if p:
+            r.ok(f"{tool}: {p}")
+        else:
+            r.fail(f"{tool} is not installed", "It is part of the toolchain idevicerestore relies on.",
+                   "Run: sudo ./install.sh")
+
+    if shutil.which("pkg-config"):
+        env = dict(os.environ)
+        env["PKG_CONFIG_PATH"] = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:" + env.get("PKG_CONFIG_PATH", "")
+        vers = []
+        for lib in ["libplist-2.0", "libimobiledevice-glue-1.0", "libtatsu-1.0", "libusbmuxd-2.0",
+                    "libimobiledevice-1.0", "libirecovery-1.0"]:
+            p = subprocess.run(["pkg-config", "--modversion", lib], capture_output=True, text=True, env=env)
+            vers.append(f"{lib.split('-')[0] if lib.count('-') == 1 else lib.rsplit('-', 1)[0]} "
+                        f"{p.stdout.strip() if p.returncode == 0 else c('31', 'missing')}")
+        r.info("libraries: " + ", ".join(vers))
+
+
+# ------------------------------------------------------------- usbmuxd ----
+def check_usbmuxd(r):
+    r.section("usbmuxd and udev")
+    rc, _ = run(["pgrep", "-x", "usbmuxd"])
+    sock = os.path.exists("/var/run/usbmuxd") or os.path.exists("/run/usbmuxd")
+    if rc == 0 and sock:
+        r.ok("usbmuxd is running")
+    elif os.path.isdir("/run/systemd/system"):
+        _, state = run(["systemctl", "is-active", "usbmuxd"])
+        r.warn(f"usbmuxd is not running (systemd state: {state or 'unknown'})",
+               "It is started automatically when a device is plugged in. If the device is plugged in, "
+               "run: sudo systemctl restart usbmuxd")
+    else:
+        r.warn("usbmuxd is not running and systemd is not available",
+               "Start it in another terminal: sudo usbmuxd -f -v")
+
+    rules = glob.glob("/etc/udev/rules.d/*usbmuxd*.rules") + glob.glob("/lib/udev/rules.d/*usbmuxd*.rules") \
+        + glob.glob("/usr/lib/udev/rules.d/*usbmuxd*.rules")
+    rec = glob.glob("/etc/udev/rules.d/*libirecovery*.rules") + glob.glob("/usr/lib/udev/rules.d/*libirecovery*.rules") \
+        + glob.glob("/lib/udev/rules.d/*libirecovery*.rules")
+    if rules:
+        r.ok("usbmuxd udev rule: " + rules[0])
+    else:
+        r.fail("usbmuxd udev rule missing", "Without it usbmuxd is not started when the device is plugged in.",
+               "Run: sudo ./install.sh --skip-deps --skip-build")
+    if rec:
+        r.ok("Recovery/DFU udev rule: " + rec[0])
+    else:
+        r.warn("libirecovery udev rule missing (Recovery/DFU devices need root)",
+               "Run idevicerestore with sudo, or: sudo ./install.sh --skip-deps --skip-build")
+
+
+# -------------------------------------------------------------- device ----
+def usb_devices():
+    devs = []
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            vid = open(os.path.join(d, "idVendor")).read().strip()
+            if vid != APPLE_VID:
+                continue
+            pid = open(os.path.join(d, "idProduct")).read().strip()
+            prod = ""
+            if os.path.exists(os.path.join(d, "product")):
+                prod = open(os.path.join(d, "product")).read().strip()
+            serial = ""
+            if os.path.exists(os.path.join(d, "serial")):
+                serial = open(os.path.join(d, "serial")).read().strip()
+            busnum = open(os.path.join(d, "busnum")).read().strip()
+            devnum = open(os.path.join(d, "devnum")).read().strip()
+            speed = open(os.path.join(d, "speed")).read().strip() if os.path.exists(os.path.join(d, "speed")) else ""
+            if pid in USB_MODES:
+                mode = USB_MODES[pid]
+            elif re.match(r"12[9a][0-9a-f]", pid):
+                mode = "Normal (booted)"
+            elif re.match(r"190[1-5]", pid):
+                mode = "Normal (Mac / Apple Silicon)"
+            else:
+                continue  # keyboards, adapters, etc.
+            devs.append(dict(pid=pid, product=prod, mode=mode, serial=serial, speed=speed,
+                             node=f"/dev/bus/usb/{int(busnum):03d}/{int(devnum):03d}"))
+        except (OSError, ValueError):
+            continue
+    return devs
+
+
+def device_identity(mode):
+    """Return dict with product_type, version, ecid where available."""
+    info = {}
+    if mode.startswith(("Recovery", "DFU", "WTF")):
+        if shutil.which("irecovery"):
+            rc, out = run(["irecovery", "-q"])
+            for line in out.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    info[k.strip()] = v.strip()
+            if "PRODUCT" in info:
+                info["product_type"] = info["PRODUCT"]
+            if "ECID" in info:
+                info["ecid"] = info["ECID"]
+            if rc != 0 and not info:
+                info["error"] = out
+    else:
+        if shutil.which("ideviceinfo"):
+            for key, name in [("ProductType", "product_type"), ("ProductVersion", "version"),
+                              ("UniqueChipID", "ecid"), ("ActivationState", "activation")]:
+                rc, out = run(["ideviceinfo", "-s", "-k", key])
+                if rc == 0 and out:
+                    info[name] = out.strip()
+                elif rc != 0:
+                    info["error"] = out
+    return info
+
+
+def check_device(r):
+    r.section("Attached Apple device")
+    devs = usb_devices()
+    if not devs:
+        r.warn("No iPhone/iPad/iPod detected on USB",
+               "Plug the device in with a data cable (not a charge-only cable). If it will not boot, "
+               "put it in Recovery mode (iPhone 8 and later: press Volume Up, Volume Down, then hold Side "
+               "until the recovery screen shows).")
+        return None
+    dev = devs[0]
+    r.ok(f"{dev['product'] or 'Apple device'} in {c('1', dev['mode'])} mode (USB id 05ac:{dev['pid']})")
+    if dev["speed"] and dev["speed"] in ("1.5", "12"):
+        r.warn(f"Device is connected at USB {dev['speed']} Mbit/s",
+               "Use a direct USB port on the computer, not a hub or front-panel port.")
+    if os.path.exists(dev["node"]) and not os.access(dev["node"], os.R_OK | os.W_OK) and os.geteuid() != 0:
+        r.info(f"No direct access to {dev['node']} as this user; run idevicerestore with sudo.")
+    ident = device_identity(dev["mode"])
+    if ident.get("product_type"):
+        extra = f", iOS {ident['version']}" if ident.get("version") else ""
+        r.ok(f"Model {ident['product_type']}{extra}" + (f", ECID {ident['ecid']}" if ident.get("ecid") else ""))
+        if ident.get("activation") and ident["activation"] != "Activated":
+            r.info(f"Activation state: {ident['activation']}")
+    elif ident.get("error"):
+        msg = ident["error"].splitlines()[0] if ident["error"] else ""
+        if "pair" in msg.lower() or "trust" in msg.lower() or "lockdown" in msg.lower():
+            r.warn(f"Could not read device info: {msg}",
+                   "Unlock the device and tap 'Trust This Computer', or put it in Recovery mode "
+                   "(restoring from Recovery mode does not need pairing).")
+        else:
+            r.warn(f"Could not read device info: {msg}",
+                   "Check that usbmuxd is running (sudo systemctl restart usbmuxd) and try sudo.")
+    dev.update(ident)
+    return dev
+
+
+# ------------------------------------------------------------- network ----
+def check_hosts_file(r):
+    try:
+        lines = open("/etc/hosts").read().splitlines()
+    except OSError:
+        return
+    bad = [l.strip() for l in lines if "apple.com" in l and not l.strip().startswith("#")]
+    if bad:
+        r.fail("/etc/hosts redirects Apple servers: " + "; ".join(bad),
+               "An entry for gs.apple.com sends the signing request to a server that is not Apple's "
+               "(left behind by old jailbreak or SHSH-saving tools), so no valid blobs come back.",
+               "Remove or comment out those lines: sudo nano /etc/hosts")
+    else:
+        r.ok("/etc/hosts has no Apple redirects")
+
+
+def proxy_info(r):
+    proxies = {k: v for k, v in os.environ.items() if k.lower() in ("http_proxy", "https_proxy", "all_proxy")}
+    if proxies:
+        r.info("Proxy settings: " + ", ".join(f"{k}={v}" for k, v in proxies.items()))
+        r.warn("A proxy is configured. 'sudo' drops proxy variables by default, so idevicerestore run "
+               "with sudo may not reach Apple even though this check does.",
+               "Use: sudo -E idevicerestore ...   (keeps the proxy variables)")
+
+
+def check_dns_tcp(r):
+    reachable = False
+    for host in TSS_HOSTS:
+        try:
+            ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
+        except socket.gaierror as e:
+            r.warn(f"DNS lookup failed for {host}: {e}")
+            continue
+        badips = [ip for ip in ips if ip in BAD_TSS_IPS or ip.startswith("127.")]
+        if badips:
+            r.fail(f"{host} resolves to {', '.join(badips)}",
+                   "That address is not Apple's signing server (it is a local or old third-party redirect).",
+                   "Check /etc/hosts, your DNS server, Pi-hole/AdGuard or VPN filters for gs.apple.com.")
+            continue
+        r.ok(f"{host} -> {', '.join(ips[:3])}")
+        if not reachable:
+            for port in (443, 80):
+                try:
+                    with socket.create_connection((host, port), timeout=8):
+                        r.ok(f"TCP connection to {host}:{port}")
+                        reachable = True
+                        break
+                except OSError as e:
+                    r.warn(f"Cannot open TCP connection to {host}:{port}: {e}")
+    return reachable
+
+
+def http(url, data=None, timeout=15, headers=None):
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    req.add_header("User-Agent", "InetURL/1.0")
+    ctx = ssl.create_default_context()
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+
+def check_tss(r):
+    """POST an empty plist to Apple's TSS server. A reachable server answers with a
+    STATUS=...&MESSAGE=... line (a rejection, which is expected for an empty request)."""
+    body = plistlib.dumps({})
+    try:
+        with http(TSS_URL, data=body, headers={"Content-Type": 'text/xml; charset="utf-8"',
+                                               "Cache-Control": "no-cache"}) as resp:
+            text = resp.read(400).decode("utf-8", "replace")
+            date = resp.headers.get("Date")
+        if "STATUS=" in text or "<?xml" in text:
+            r.ok(f"Apple TSS server answered: {text.strip()[:80]}")
+        else:
+            r.warn(f"Apple TSS server answered unexpectedly: {text.strip()[:80]!r}",
+                   "A captive portal, firewall or filtering proxy may be intercepting the request.")
+        return date
+    except urllib.error.HTTPError as e:
+        r.ok(f"Apple TSS server reachable (HTTP {e.code})")
+        return e.headers.get("Date")
+    except ssl.SSLError as e:
+        r.warn(f"TLS error talking to gs.apple.com: {e}",
+               "Install CA certificates (sudo apt install ca-certificates) and check the system clock. "
+               "A TLS-inspecting proxy can also cause this.")
+    except Exception as e:  # noqa: BLE001
+        r.fail("Cannot reach Apple's signing (TSS) server gs.apple.com",
+               f"idevicerestore must ask Apple to sign the firmware for this exact device. The request failed: {e}. "
+               "This is the most common cause of 'Unable to get SHSH blobs' on a fresh machine.",
+               "Connect to the internet without filtering; allow outbound HTTPS to gs.apple.com "
+               "(corporate/school firewalls, VPNs and DNS ad-blockers often block it). If you need a "
+               "proxy, export https_proxy and run sudo -E idevicerestore.")
+    return None
+
+
+def check_clock(r, date_header):
+    if not date_header:
+        return
+    try:
+        server = email.utils.parsedate_to_datetime(date_header)
+        skew = abs((dt.datetime.now(dt.timezone.utc) - server).total_seconds())
+        if skew > 300:
+            r.warn(f"System clock is off by {int(skew // 60)} minutes",
+                   "Enable time sync: sudo timedatectl set-ntp true")
+        else:
+            r.ok("System clock is in sync")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def check_downloads(r):
+    try:
+        with http(VERSION_XML_URL, timeout=15) as resp:
+            resp.read(64)
+        r.ok("Apple firmware list (itunes.apple.com) reachable, so 'idevicerestore -l' can download firmware")
+    except Exception as e:  # noqa: BLE001
+        r.warn(f"Cannot reach itunes.apple.com firmware list: {e}",
+               "'idevicerestore -l' will not be able to find the latest firmware; download the .ipsw manually "
+               "and pass its path instead.")
+
+
+def check_network(r):
+    r.section("Network access to Apple")
+    proxy_info(r)
+    check_hosts_file(r)
+    check_dns_tcp(r)
+    date = check_tss(r)
+    check_clock(r, date)
+    check_downloads(r)
+
+
+# ------------------------------------------------------------- signing ----
+def fetch_signed(model):
+    with http(IPSW_API.format(model), timeout=20) as resp:
+        data = json.load(resp)
+    return data.get("name", model), data.get("firmwares", [])
+
+
+def check_signing(r, model, ipsw_info=None):
+    r.section(f"Firmware signing status for {model}")
+    try:
+        name, fws = fetch_signed(model)
+    except Exception as e:  # noqa: BLE001
+        r.info(f"Could not query api.ipsw.me ({e}). Skipping signing check; 'idevicerestore -l' always "
+               "picks a signed version.")
+        return
+    signed = [f for f in fws if f.get("signed")]
+    if not signed:
+        r.fail(f"Apple is not signing any firmware for {name} right now",
+               "Without a signed firmware no restore is possible.", "Try again later.")
+        return
+    r.ok(f"{name}: Apple currently signs " + ", ".join(f"{f['version']} ({f['buildid']})" for f in signed))
+    if ipsw_info:
+        build = ipsw_info["build"]
+        if any(f.get("buildid") == build for f in signed):
+            r.ok(f"Your IPSW {ipsw_info['version']} ({build}) is signed")
+        else:
+            r.fail(f"Your IPSW {ipsw_info['version']} ({build}) is no longer signed by Apple",
+                   "Apple stops signing older iOS versions, usually a couple of weeks after a new release. "
+                   "The TSS server then refuses the request (status 94: 'This device isn't eligible for "
+                   "the requested build') and idevicerestore prints 'Unable to get SHSH blobs for this "
+                   "device'. Downgrading to an unsigned version is not possible.",
+                   f"Use a signed version: sudo idevicerestore -e -l   (downloads {signed[0]['version']}), "
+                   "or download the signed IPSW from https://ipsw.me/" + model)
+
+
+def read_ipsw(path):
+    with zipfile.ZipFile(path) as z:
+        with z.open("BuildManifest.plist") as f:
+            bm = plistlib.load(f)
+    return dict(version=bm.get("ProductVersion"), build=bm.get("ProductBuildVersion"),
+                devices=bm.get("SupportedProductTypes", []))
+
+
+def check_ipsw(r, path, device):
+    r.section(f"IPSW {os.path.basename(path)}")
+    try:
+        info = read_ipsw(path)
+    except (OSError, zipfile.BadZipFile, KeyError) as e:
+        r.fail("The IPSW file cannot be read", f"{e}. The download is probably incomplete or corrupt.",
+               "Download it again (and compare the SHA1 shown on ipsw.me).")
+        return None
+    r.ok(f"iOS {info['version']} ({info['build']}) for {', '.join(info['devices'])}")
+    model = device.get("product_type") if device else None
+    if model and model not in info["devices"]:
+        r.fail(f"This IPSW is not for your device ({model})",
+               "Each IPSW only supports specific models. idevicerestore reports 'Unable to find a matching "
+               "build identity' or TSS rejects the request.",
+               f"Download the IPSW for {model} from https://ipsw.me/{model}")
+    return info
+
+
+# ------------------------------------------------------------- explain ----
+EXPLANATIONS = [
+    (r"TSS request failed \(status=(94|69)",
+     "Apple refused to sign this firmware for your device (TSS status {1}: 'This device isn't eligible "
+     "for the requested build').",
+     "Almost always the firmware is no longer signed (Apple stops signing old iOS versions), the IPSW is "
+     "for a different model, or you are using an outdated idevicerestore/libtatsu from the distro "
+     "packages that builds requests Apple no longer accepts.",
+     "1) Use the latest signed firmware: sudo idevicerestore -e -l\n"
+     "           2) Check signing: idr-doctor signed <model>\n"
+     "           3) If the version IS signed, rebuild the toolchain: sudo ./install.sh --remove-distro-packages"),
+    (r"TSS request failed \(status=(100|126)",
+     "Apple's TSS server says the request was malformed (status {1}).",
+     "Your idevicerestore/libtatsu build is too old to build a valid request for this device or firmware.",
+     "Rebuild from current source: sudo ./install.sh --remove-distro-packages"),
+    (r"TSS request failed \(status=(8|49)",
+     "Apple rejected the baseband part of the signing request (status {1}).",
+     "Usually an outdated build or a device whose baseband info could not be read.",
+     "Rebuild with sudo ./install.sh, then retry in Recovery mode."),
+    (r"(Could not resolve host|Couldn't resolve host)",
+     "The machine could not look up Apple's signing server name (DNS failure).",
+     "No internet, a broken DNS server, or a DNS filter (Pi-hole/AdGuard/corporate DNS) blocking gs.apple.com.",
+     "Fix DNS or internet access, then run: idr-doctor network"),
+    (r"(Failed to connect|Couldn't connect|Connection refused|Connection timed out|Timeout was reached|"
+     r"Operation timed out|Network is unreachable)",
+     "The machine could not connect to Apple's signing server.",
+     "Firewall, VPN, captive portal or a proxy that sudo does not pass through.",
+     "Allow outbound HTTPS/HTTP to gs.apple.com. With a proxy use: sudo -E idevicerestore ...  Then run: idr-doctor network"),
+    (r"(SSL|certificate|TLS)",
+     "A TLS/SSL error occurred while downloading or talking to Apple.",
+     "Missing CA certificates, a wrong system clock, or a TLS-inspecting proxy.",
+     "sudo apt install ca-certificates (or your distro's equivalent) and sudo timedatectl set-ntp true"),
+    (r"Unable to find a matching build identity",
+     "The IPSW does not contain firmware for this device.",
+     "Wrong IPSW for the model, or idevicerestore is too old to recognise a new device.",
+     "Download the IPSW for your exact model, or rebuild with sudo ./install.sh"),
+    (r"is not supported by this IPSW|not supported by this firmware",
+     "The IPSW does not support this device model.", "Wrong file.",
+     "Download the right IPSW from https://ipsw.me or use sudo idevicerestore -e -l"),
+    (r"No firmwares are currently being signed",
+     "Apple is not signing any firmware for this model.", "Nothing can be done locally.", "Try again later."),
+    (r"Could not fetch list of signed firmwares",
+     "idevicerestore -l could not download Apple's firmware list.",
+     "No access to itunes.apple.com.",
+     "Fix network access, or download the IPSW manually and pass its path."),
+    (r"(Unable to discover device mode|No device found|Unable to find device)",
+     "idevicerestore cannot see the device.",
+     "usbmuxd not running, missing udev rules, charge-only cable, or a USB hub.",
+     "sudo systemctl restart usbmuxd, use a direct port and data cable, run with sudo, or enter Recovery mode."),
+    (r"Make sure that usbmuxd is running",
+     "usbmuxd is not running.", "The USB multiplexing daemon is needed for devices in normal mode.",
+     "sudo systemctl restart usbmuxd  (or: sudo usbmuxd -f -v)"),
+    (r"(Could not connect to lockdownd|Pairing|not paired|trust)",
+     "The device refused the connection because this computer is not trusted.",
+     "Normal-mode restores need the device unlocked and 'Trust This Computer' accepted.",
+     "Unlock and tap Trust, or put the device in Recovery mode and retry."),
+    (r"(Device did not reconnect|Device failed to enter restore mode|Possibly invalid iBEC)",
+     "The device did not come back after a mode switch.",
+     "USB reset problems (hubs, USB 3 controllers, VMs) or a personalised image that failed.",
+     "Use a direct USB 2.0/3.0 port without a hub (not a VM if possible), reboot the device into Recovery and retry."),
+    (r"Unable to get SHSH blobs for this device \(local policy\)",
+     "Signing the Mac LocalPolicy failed.", "Old build or network problem.",
+     "Rebuild with sudo ./install.sh, then check idr-doctor network."),
+]
+
+
+def explain_text(text):
+    found = []
+    for pattern, what, why, fix in EXPLANATIONS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            found.append((what.replace("{1}", m.group(1) if m.groups() else ""), why, fix))
+    server = re.findall(r"TSS server returned: (.+)", text)
+    shsh = "Unable to get SHSH blobs" in text
+    print(c("1", "idevicerestore log analysis"))
+    if server:
+        print(f"  Apple's TSS server said: {server[-1].strip()[:200]}")
+    if not found and shsh:
+        found.append(("idevicerestore could not get a signing ticket (SHSH blobs) from Apple.",
+                      "Common causes, in order: (1) the firmware/IPSW is no longer signed, (2) no network "
+                      "access to gs.apple.com, (3) an outdated distro build of idevicerestore without libtatsu, "
+                      "(4) the IPSW is for a different model.",
+                      "Run 'idr-doctor' with the device connected; it checks each of these. Run idevicerestore "
+                      "with -d to see the TSS server's exact reply."))
+    if not found:
+        print("  No known error pattern found." + ("" if "Restore Finished" not in text else
+                                                    " The log says the restore finished."))
+        return 0
+    for i, (what, why, fix) in enumerate(found, 1):
+        print(f"\n  {c('31', f'{i}. {what}')}")
+        print(f"     Why:  {why}")
+        print(f"     Fix:  {fix}")
+    print("\n  Note: Activation Lock is not affected by a restore. After restoring, a device with Find My "
+          "enabled still asks for the owner's Apple ID.")
+    return 1
+
+
+# ------------------------------------------------------------ commands ----
+def cmd_check(args):
+    r = Report()
+    print(c("1", f"idr-doctor {VERSION}") + " - idevicerestore environment check")
+    check_tools(r)
+    check_usbmuxd(r)
+    dev = check_device(r)
+    check_network(r)
+    ipsw = None
+    if args.ipsw:
+        ipsw = check_ipsw(r, args.ipsw, dev)
+    model = (dev or {}).get("product_type") or args.model or (ipsw["devices"][0] if ipsw and ipsw["devices"] else None)
+    if model:
+        check_signing(r, model, ipsw)
+    return r.summary()
+
+
+def cmd_network(_):
+    r = Report()
+    check_network(r)
+    return r.summary()
+
+
+def cmd_device(_):
+    r = Report()
+    check_usbmuxd(r)
+    check_device(r)
+    return r.summary()
+
+
+def cmd_signed(args):
+    model = args.model
+    if not model:
+        dev = (usb_devices() or [None])[0]
+        model = device_identity(dev["mode"]).get("product_type") if dev else None
+    if not model:
+        print("Give a model identifier, e.g.: idr-doctor signed iPhone12,1")
+        return 2
+    r = Report()
+    check_signing(r, model)
+    return r.summary()
+
+
+def cmd_ipsw(args):
+    r = Report()
+    devs = usb_devices()
+    dev = None
+    if devs:
+        dev = devs[0]
+        dev.update(device_identity(dev["mode"]))
+    info = check_ipsw(r, args.file, dev)
+    if info:
+        model = (dev or {}).get("product_type") or (info["devices"][0] if info["devices"] else None)
+        if model:
+            check_signing(r, model, info)
+    return r.summary()
+
+
+def cmd_explain(args):
+    text = open(args.logfile, errors="replace").read() if args.logfile else sys.stdin.read()
+    return explain_text(text)
+
+
+def cmd_restore(args):
+    binary = shutil.which("idevicerestore", path="/usr/local/bin:" + os.environ.get("PATH", ""))
+    if not binary:
+        print("idevicerestore not found. Run: sudo ./install.sh")
+        return 1
+    extra = [a for a in args.args if a != "--"]
+    if not extra:
+        print("Pass idevicerestore arguments after --, for example:\n"
+              "  sudo idr-doctor restore -- -e -l                 erase and install the latest signed iOS\n"
+              "  sudo idr-doctor restore -- -e ./device.ipsw      erase and install a downloaded IPSW")
+        return 2
+    for a in extra:
+        if a.endswith(".ipsw") and os.path.isfile(a):
+            r = Report()
+            devs = usb_devices()
+            dev = devs[0] if devs else None
+            if dev:
+                dev.update(device_identity(dev["mode"]))
+            info = check_ipsw(r, a, dev)
+            model = (dev or {}).get("product_type")
+            if info and model:
+                check_signing(r, model, info)
+            if r.problems:
+                r.summary()
+                print("\nNot starting the restore because of the problems above.")
+                return 1
+    os.makedirs(args.log_dir, exist_ok=True)
+    log = os.path.join(args.log_dir, dt.datetime.now().strftime("idevicerestore-%Y%m%d-%H%M%S.log"))
+    cmd = [binary] + extra
+    print(c("1", "Running: ") + " ".join(cmd) + f"\nLog: {log}\n")
+    with open(log, "w") as lf:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in p.stdout:
+            sys.stdout.write(line)
+            lf.write(line)
+        rc = p.wait()
+    print()
+    text = open(log, errors="replace").read()
+    if rc == 0 and "ERROR" not in text:
+        print(c("32", "Restore finished.") + " If Find My was on, the device will ask for the owner's Apple ID "
+              "during setup (Activation Lock).")
+        print("Free disk space afterwards with: idr-doctor clean")
+        return 0
+    explain_text(text)
+    print(f"\nFull log saved to {log}. Run 'idr-doctor' for a full environment check.")
+    return rc or 1
+
+
+def cmd_clean(args):
+    base = args.dir
+    targets = [p for p in glob.glob(os.path.join(base, "*")) if os.path.isdir(p)
+               and os.path.exists(os.path.join(p, "BuildManifest.plist"))]
+    ipsws = glob.glob(os.path.join(base, "*.ipsw")) if args.ipsw else []
+    if not targets and not ipsws:
+        print(f"Nothing to clean in {base}.")
+        return 0
+    for t in targets + ipsws:
+        size = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(t) for f in fs) \
+            if os.path.isdir(t) else os.path.getsize(t)
+        print(f"  {t}  ({size / 1e9:.1f} GB)")
+    if not args.yes and input("Delete these? [y/N] ").strip().lower() != "y":
+        return 1
+    for t in targets + ipsws:
+        shutil.rmtree(t) if os.path.isdir(t) else os.remove(t)
+    print("Deleted.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="idr-doctor", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("check", help="full diagnosis (default)")
+    p.add_argument("--ipsw", help="also check this IPSW file")
+    p.add_argument("--model", help="model identifier if no device is attached, e.g. iPhone12,1")
+    p.set_defaults(func=cmd_check)
+    sub.add_parser("network", help="Apple TSS connectivity checks").set_defaults(func=cmd_network)
+    sub.add_parser("device", help="USB / device checks").set_defaults(func=cmd_device)
+    p = sub.add_parser("signed", help="list firmware Apple still signs")
+    p.add_argument("model", nargs="?")
+    p.set_defaults(func=cmd_signed)
+    p = sub.add_parser("ipsw", help="check an IPSW file")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_ipsw)
+    p = sub.add_parser("explain", help="explain an idevicerestore log")
+    p.add_argument("logfile", nargs="?")
+    p.set_defaults(func=cmd_explain)
+    p = sub.add_parser("restore", help="run idevicerestore with logging and diagnosis")
+    p.add_argument("--log-dir", default=os.path.expanduser("~/idevicerestore-logs"))
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_restore)
+    p = sub.add_parser("clean", help="delete extracted IPSW folders")
+    p.add_argument("dir", nargs="?", default=os.getcwd())
+    p.add_argument("--ipsw", action="store_true", help="also delete .ipsw files")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_clean)
+    args = ap.parse_args()
+    if not args.cmd:
+        args = ap.parse_args(["check"] + sys.argv[1:])
+    try:
+        sys.exit(args.func(args))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
