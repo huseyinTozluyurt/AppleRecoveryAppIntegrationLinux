@@ -1,6 +1,6 @@
-# idevicerestore-setup
+# Apple Recovery App for Linux (idevicerestore-setup)
 
-[![CI](https://github.com/huseyinTozluyurt/idevicerestore-setup/actions/workflows/ci.yml/badge.svg)](https://github.com/huseyinTozluyurt/idevicerestore-setup/actions/workflows/ci.yml)
+[![CI](https://github.com/huseyinTozluyurt/AppleRecoveryAppIntegrationLinux/actions/workflows/ci.yml/badge.svg)](https://github.com/huseyinTozluyurt/AppleRecoveryAppIntegrationLinux/actions/workflows/ci.yml)
 
 A setup and diagnostic tool that prepares any Linux machine to restore iPhones,
 iPads and iPods with [idevicerestore](https://github.com/libimobiledevice/idevicerestore),
@@ -23,14 +23,14 @@ fresh machine.
 One line (downloads this repo and runs the installer):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huseyinTozluyurt/idevicerestore-setup/main/get.sh | bash
+curl -fsSL https://raw.githubusercontent.com/huseyinTozluyurt/AppleRecoveryAppIntegrationLinux/main/get.sh | bash
 ```
 
 Or step by step:
 
 ```bash
-git clone https://github.com/huseyinTozluyurt/idevicerestore-setup.git
-cd idevicerestore-setup
+git clone https://github.com/huseyinTozluyurt/AppleRecoveryAppIntegrationLinux.git
+cd AppleRecoveryAppIntegrationLinux
 sudo ./install.sh            # asks before removing old distro packages
 idr-doctor                   # check everything with the device plugged in
 sudo idr-doctor restore -- -e -l                       # erase + latest signed iOS
@@ -125,7 +125,7 @@ After a restore, a device that had Find My enabled asks for the owner's Apple ID
 ## Updating
 
 ```bash
-cd idevicerestore-setup && git pull && sudo ./install.sh --update
+cd AppleRecoveryAppIntegrationLinux && git pull && sudo ./install.sh --update
 ```
 
 This also rebuilds the libimobiledevice stack from the latest upstream source,
